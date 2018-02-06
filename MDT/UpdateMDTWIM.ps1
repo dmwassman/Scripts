@@ -72,7 +72,7 @@ Param
 
 try{
     [void](Import-Module 'C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\DISM\dism.psd1' -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-}catch{}
+}catch{throw $_}
 
 
 function addUpdate{
@@ -85,14 +85,14 @@ function addUpdate{
     $output = New-Object -TypeName PSObject
     $output | Add-Member -NotePropertyName Save -NotePropertyValue $false
     $output | Add-Member -NotePropertyName Message -NotePropertyValue ""
-
+    $output | Add-Member -NotePropertyName Color -NotePropertyValue "Blue"
 
     try{
-        $package = $(Get-WindowsPackage -Path $mount -PackagePath "$file").PackageName
+        $package = $(Get-WindowsPackage -Path $mount -PackagePath "$file" -ErrorAction SilentlyContinue -WarningAction SilentlyContinue).PackageName
     }catch{}
 
     if($package -ne $null){
-        if(!(Get-WindowsPackage -Path $mount | where{$_.PackageName -eq $package})){
+        if(!(Get-WindowsPackage -Path $mount  -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | where{$_.PackageName -eq $package})){
             try{
                 Write-Verbose "Installing $package..."
                 [void](Add-WindowsPackage -Path $mount -PackagePath "$file" -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
@@ -102,16 +102,15 @@ function addUpdate{
                 if(Test-Path -Path "$file.failure.txt"){
                     Remove-Item -Path "$file.failure.txt" -Force
                 }
+                $output.Color = "Green"
             }catch{
                 $count = $count + 1
-                Write-Verbose "Count = $count"
-                Write-Verbose "$file.failure.txt"
                 "$count;$id" > "$file.failure.txt"
                 if(Test-Path -Path "$file.success.txt"){
                     Remove-Item -Path "$file.success.txt" -Force
                 }
                 $output.Message = "Failed to install $package"
-            
+                $output.Color = "Red"
             }
         }else{
             $output.Message = "$package already installed in WIM."
@@ -123,6 +122,7 @@ function addUpdate{
        
     }else{
         $output.Message = "Unable to query image."
+        $output.Color = "Red"
     }
     Remove-Item -Path "$file" -Force
     return $output
@@ -166,6 +166,9 @@ try {
     #A login error is non-terminating, so we need to make it terminating
     throw $_
 }
+
+[int]$progress = 0
+
 $updateScope = New-Object Microsoft.UpdateServices.Administration.UpdateScope
 $updateScope.ApprovedStates="Any"
 $group = $wsus.GetComputerTargetGroups() | where{$_.Name -eq $TargetGroup}
@@ -173,6 +176,11 @@ if($group -ne $null){
     Write-Verbose "Adding $TargetGroup to scope."
     [void]($updateScope.ApprovedComputerTargetGroups.Add($group))
     Write-Output "Added $TargetGroup group to scope."
+
+    Write-Progress -Activity "Preparing to patch WIM files" -Status "Gathering Update IDs" -PercentComplete 0
+    $files = $($wsus.GetUpdateApprovals($updateScope)).UpdateId.UpdateId.Guid | Get-Unique
+    $number = $($files | Measure-Object).Count
+    Write-Output "$number update IDs found."
 
     Get-ChildItem -Path "$Path\Operating Systems\" -Directory | where{Test-Path -Path "$($_.Fullname)\sources\install.wim"} | foreach{
         $image = "$($_.Fullname)\sources\install.wim"
@@ -195,12 +203,14 @@ if($group -ne $null){
                 Get-WindowsImage -Mounted | foreach{
                     if($_.ImagePath -eq $image){
                         Write-Output "$image is already mounted. Dismounting and discarding."
+                        Write-Progress -Activity "Patching $product" -Status "Dismounting $($_.Path)" -PercentComplete 0
                         [void](Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue)
                     }
                 }
                 Get-WindowsImage -Mounted | foreach{
                     if($_.Path -eq $mount){
                         Write-Output "Mount path is in use. Dismounting and discarding."
+                        Write-Progress -Activity "Patching $product" -Status "Dismounting $($_.Path)" -PercentComplete 0
                         [void](Dismount-WindowsImage -Path $_.Path -Discard -ErrorAction SilentlyContinue)
                     }
                 }
@@ -209,42 +219,39 @@ if($group -ne $null){
                     if($_.Path -eq $mount){
                         if($_.MountStatus -eq "Invalid"){
                             Write-Output "Mount path is invalid. Cleaning up."
+                            Write-Progress -Activity "Patching $product" -Status "Mount path is invalid. Cleaning up." -PercentComplete 0
                             [void](&"C:\Windows\System32\Dism.exe" /cleanup-Wim)
                         }
                     }
                 }
                 Write-Output "Mounting $image to $mount"
                 [void](Mount-WindowsImage -Path $mount -ImagePath $image -Index $index -ScratchDirectory $scratch)
-                Write-Progress -Activity "Patching $product"
+               
             }else{
                 $bolSave = $true            
             }
             $count = 0
-            $files = $($wsus.GetUpdateApprovals($updateScope)).UpdateId.UpdateId.Guid | Get-Unique
-            $number = $($files | Measure-Object).Count
+            
+             Write-Progress -Activity "Patching $product"
+            $ids=@()
             $files | foreach{
                 $id = $_
-                Get-WsusUpdate -UpdateServer $wsus -UpdateId $_ | foreach{
+                Get-WsusUpdate -UpdateServer $wsus -UpdateId $_ | where{-not $_.Update.IsSuperseded} | foreach{
                     if($_.Products -notcontains $product){
-                        $number = $number + 1
+                        $number = $number - 1
                     }else{
-                       
-
-                        $($wsus.SearchUpdates($_.Update.Title).GetInstallableItems().Files.FileUri.AbsoluteUri) | foreach{
-                            $count = $count + 1     
-
-                            [int]$failure = 0
-                            $http = $_
-                            $file = $http.substring($http.LastIndexOf("/") + 1)
-                            $folder = $updates + "\" + $file.substring(0,$file.LastIndexOf("_")).Replace("-express","")
-                            [int]$progress = $count/$number
-        
+                        $ids += $id
+                        $count = $count + 1     
+                        $($_.Update.GetInstallableItems().Files | where{$_.Type -eq "SelfContained"} -and $_.FileUri.AbsoluteUri -ne $null).FileUri.AbsoluteUri | foreach{
+                            if($_ -ne $null){
+                                [int]$failure = 0
+                                $http = $_
+                                $file = $http.substring($http.LastIndexOf("/") + 1)
+                                $folder = $updates + "\" + $file.substring(0,$file.LastIndexOf("_")).Replace("-express","")
                             
-                            
-                           
-                        
-                            if($file.ToUpper().substring($file.length - 4) -eq ".CAB"){
+                                [int]$progress = $count/$number
                                 Write-Progress -Activity "Patching $product" -Status "Processing $file" -PercentComplete $progress
+                            
                                 if(Test-Path -Path "$folder\$file.success.txt"){
                                     Get-Content -Path "$folder\$file.success.txt" | foreach{
                                         $package = $_.Split(";")[0]
@@ -257,10 +264,10 @@ if($group -ne $null){
                                                 if($patch.Save){
                                                     $bolSave = $true
                                                 }
-                                                Write-Output $patch.Message
+                                                Write-Host $patch.Message -BackgroundColor $patch.Color
                                             }
                                         }else{
-                                            Write-Output "$package already installed in WIM."
+                                            Write-Host "$package already installed in WIM." -BackgroundColor "Blue"
                                         }
                                     }
                                 }elseif(Test-Path -Path "$folder\$file.failure.txt"){
@@ -275,7 +282,8 @@ if($group -ne $null){
                                                 if($patch.Save){
                                                     $bolSave = $true
                                                 }
-                                                Write-Output $patch.Message
+                                                Write-Host $patch.Message -BackgroundColor $patch.Color
+                                           
                                             }
                                         }
                                     }
@@ -293,12 +301,12 @@ if($group -ne $null){
                                         if($patch.Save){
                                             $bolSave = $true
                                         }
-                                        Write-Output $patch.Message
+                                        Write-Host $patch.Message -BackgroundColor $patch.Color
                                     }
                                 }
                                 Write-Output "Processed $file."
                             }
-                        }
+                        }                        
                    }
                 }
                       
@@ -307,23 +315,25 @@ if($group -ne $null){
             Write-Progress -Activity "Patching $product" -Status "Removing unapproved patches" -PercentComplete $progress
 
             if(!($DisplayTitlesOnly)){
-                $files = Get-ChildItem -Path "$updates\*\*.txt" -Recurse 
-                $number = $($files | Measure-Object).Count + $number
-                $files | foreach{
+                $check = Get-ChildItem -Path "$updates\*\*.txt" -Recurse 
+                $number = $($check | Measure-Object).Count + $number
+                $check | foreach{
                     $folder = $_.DirectoryName
-                    Get-Content -Path $_.FullName | foreach{
+                    $bolRemove = $false
+                    Get-Content -Path $_.FullName -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | foreach{
                         $package = $_.Split(";")[0]
                         $id = $_.Split(";")[1]
-                        if(!(($wsus.GetUpdateApprovals($updateScope)).UpdateId.UpdateId.Guid | Get-Unique | where{$_ -eq $id})){
+                        if(!($ids | where{$_ -eq $id})){
                             $count = $count + 1
-                            [int]$progress = $count/$number
+                            $progress = $count/$number
                             Write-Progress -Activity "Patching $product" -Status "Removing unapproved patches" -PercentComplete $progress
                                   
-                            if(Get-WindowsPackage -Path $mount -PackageName $package){
+                            if(Get-WindowsPackage -Path $mount -PackageName $package -ErrorAction SilentlyContinue -WarningAction SilentlyContinue){
                                 try{
                                     Write-Progress -Activity "Patching $product" -Status "Removing $package" -PercentComplete $progress
-                                    [void](Remove-WindowsPackage -Path $mount -PackageName $package -ScratchDirectory $scratch)
+                                    [void](Remove-WindowsPackage -Path $mount -PackageName $package -ScratchDirectory $scratch -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
                                     $bolSave = $true
+                                    $bolRemove = $true
                                     Write-Output "Removed $package."
                                 }catch{
                                     Write-Output "Failed to remove $package."
@@ -331,9 +341,13 @@ if($group -ne $null){
 
 
                             }
-                            Write-Progress -Activity "Patching $product" -Status "Removing $folder" -PercentComplete $progress
-                            Remove-Item -Path $folder -Force -Recurse
+                           
                         }
+                    }
+                    if($bolRemove){
+                        Write-Progress -Activity "Patching $product" -Status "Removing $folder" -PercentComplete $progress
+                        Remove-Item -Path $folder -Force -Recurse -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+                        Write-Output "Removed $folder."
                     }
                 }
             }

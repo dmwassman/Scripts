@@ -1,5 +1,5 @@
-# powershell
-Various powershel scripts for system management and automation.
+# Scripts
+Various scripts for system management and automation.
 
 MDT - Scripts for MDT 
 
