@@ -6,6 +6,7 @@
 .NOTES 
     Requirements:
         Microsoft Graph PowerShell SDK
+        Self-Signed Certificate in local Machine store
     File Name: 
         mfaRemind.ps1
     By: 
@@ -19,7 +20,8 @@
 # ===========================
 $tenantId = "1234567890"       # Azure AD tenant ID
 $applicationId = "0987654321"  # App registration (client ID)
-$clientSecretValue = "1234567890" # Client secret value
+#$clientSecretValue = "1234567890" # Client secret value (less secure way)
+$certThumbprint = "ABCD1234567890987654321"
 $logFile = "C:\IT\Logs\MFA_Reminder_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
 # Counters for summary
@@ -40,14 +42,18 @@ function Write-Log {
 # Authentication
 # ===========================
 # Convert client secret to a secure string
-$pass = ConvertTo-SecureString -String $clientSecretValue -AsPlainText -Force
+#$pass = ConvertTo-SecureString -String $clientSecretValue -AsPlainText -Force
 
 # Build credential object (App ID + secret)
-$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $applicationId, $pass
+#$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $applicationId, $pass
+
+# Build certificate object
+$cert = Get-ChildItem Cert:\LocalMachine\My\$certThumbprint
 
 # Connect to Microsoft Graph with app-only authentication
 try {
-    Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $cred -NoWelcome
+    #Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $cred -NoWelcome
+    Connect-MgGraph -TenantId $tenantId -ClientId $applicationId -Certificate $cert -NoWelcome
     Write-Log "Connected to Microsoft Graph successfully."
 }
 catch {
