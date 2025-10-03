@@ -1,0 +1,161 @@
+<#
+.SYNOPSIS 
+    Reminds users to setup MFA in M365.
+.DESCRIPTION 
+    Pulls users that have SSPR enabled but not MFA in M365 and sends them a reminder email to setup MFA.
+.NOTES 
+    Requirements:
+        Microsoft Graph PowerShell SDK
+    File Name: 
+        mfaRemind.ps1
+    By: 
+        David Wassman
+.OUTPUTS 
+    Log file containing results of script run
+#>
+
+# ===========================
+# Configuration
+# ===========================
+$tenantId = "1234567890"       # Azure AD tenant ID
+$applicationId = "0987654321"  # App registration (client ID)
+$clientSecretValue = "1234567890" # Client secret value
+$logFile = "C:\IT\Logs\MFA_Reminder_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
+# Counters for summary
+$sentCount = 0
+$skippedCount = 0
+$failedCount = 0
+
+# Function to log messages with timestamps
+function Write-Log {
+    param([string]$Message)
+    $time = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $entry = "$time - $Message"
+    Add-Content -Path $logFile -Value $entry
+    Write-Output $entry
+}
+
+# ===========================
+# Authentication
+# ===========================
+# Convert client secret to a secure string
+$pass = ConvertTo-SecureString -String $clientSecretValue -AsPlainText -Force
+
+# Build credential object (App ID + secret)
+$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $applicationId, $pass
+
+# Connect to Microsoft Graph with app-only authentication
+try {
+    Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $cred -NoWelcome
+    Write-Log "Connected to Microsoft Graph successfully."
+}
+catch {
+    Write-Log "ERROR: Failed to connect to Microsoft Graph. $_"
+    exit 1
+}
+
+# ===========================
+# Email Setup
+# ===========================
+$sender = "helpdesk@ocpmgmt.com"   # From address
+$subject = "Action Required: Please Enable MFA for Microsoft 365"
+
+# Attachment: MFA setup guide
+$filePath = "C:\IT\M365 Multifactor Authentication Enrollment Guide.pdf"
+$fileName = [System.IO.Path]::GetFileName($filePath)
+
+# Determine MIME type and convert file to base64 for Graph API attachment
+Add-Type -AssemblyName System.Web
+$contentType = [System.Web.MimeMapping]::GetMimeMapping($fileName)
+$attachmentContent = [Convert]::ToBase64String([IO.File]::ReadAllBytes($filePath))
+
+# ===========================
+# User Loop
+# ===========================
+# Get users who have SSPR enabled but are NOT MFA capable
+Get-MgReportAuthenticationMethodUserRegistrationDetail | Where-Object {
+    $_.IsSsprEnabled -and -not $_.IsMfaCapable
+} | ForEach-Object {
+    $user = $($_.userPrincipalName).ToString().Trim()
+
+    # Skip users who are members of "M365 MFA NoWarn" group
+    $isNoWarn = $false
+    try {
+        $adUser = Get-ADUser -Filter {userPrincipalName -eq $user} -Properties MemberOf
+        $noWarnGroup = (Get-ADGroup -Identity "M365 MFA NoWarn").DistinguishedName
+        if ($adUser.MemberOf -contains $noWarnGroup) {
+            $isNoWarn = $true
+        }
+    }
+    catch {
+        Write-Log "WARNING: Could not check NoWarn group membership for $user. $_"
+        $isNoWarn = $true # default to skipping if check fails
+    }
+
+    if (-not $isNoWarn) {
+        $recipient = "$($_.userPrincipalName)"
+
+        # Email body (HTML formatted)
+        $body = @"
+Hello $($_.userDisplayName),<br>
+<br>
+Our records show that you have not yet set up Multi-Factor Authentication (MFA) on your Microsoft 365 account.<br>
+MFA will be required when accessing Microsoft 365 outside the office.<br>
+<br>
+Please complete the setup today. Instructions are attached.<br>
+<br>
+If you need assistance, please reply to this email or send an email to the IT Help Desk at helpdesk@ocpmgmt.com.<br>
+<br>
+Thank you for helping us keep our systems secure.<br>
+"@
+
+        # Graph API message payload
+        $emailParams = @{
+            message = @{
+                subject = $subject
+                body = @{
+                    contentType = "HTML"
+                    content = $body
+                }
+                toRecipients = @(
+                    @{
+                        emailAddress = @{
+                            address = $recipient
+                        }
+                    }
+                )
+                attachments = @(
+                    @{
+                        "@odata.type" = "#microsoft.graph.fileAttachment"
+                        name = $fileName
+                        contentType = $contentType
+                        contentBytes = $attachmentContent
+                    }
+                )
+            }
+            saveToSentItems = "false"
+        }
+
+        # Attempt to send the email
+        try {
+            Send-MgUserMail -UserId $sender -BodyParameter $emailParams
+            Write-Log "SUCCESS: MFA reminder sent to $recipient"
+            $sentCount++
+        }
+        catch {
+            Write-Log "ERROR: Failed to send MFA reminder to $recipient. $_"
+            $failedCount++
+        }
+    }
+    else {
+        Write-Log "SKIPPED: $user is in M365 MFA NoWarn group or check failed."
+        $skippedCount++
+    }
+}
+
+# ===========================
+# Summary
+# ===========================
+Write-Log "Script completed."
+Write-Log "Summary: Sent = $sentCount | Skipped = $skippedCount | Failed = $failedCount"
