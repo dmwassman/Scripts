@@ -6,65 +6,71 @@
 .NOTES 
     Requirements:
         Microsoft Graph PowerShell SDK
-        Self-Signed Certificate in local Machine store
     File Name: 
         mfaRemind.ps1
     By: 
         David Wassman
+    Date:
+        October 3, 2025
 .OUTPUTS 
-    Log file containing results of script run
+    Log file containing results of script run (CMtrace format)
 #>
 
 # ===========================
 # Configuration
 # ===========================
-$tenantId = "1234567890"       # Azure AD tenant ID
-$applicationId = "0987654321"  # App registration (client ID)
-#$clientSecretValue = "1234567890" # Client secret value (less secure way)
-$certThumbprint = "ABCD1234567890987654321"
-$logFile = "C:\IT\Logs\MFA_Reminder_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$tenantId = "1234567890"              # Azure AD tenant ID
+$applicationId = "0987654321"         # App registration (client ID)
+#$clientSecretValue = "097654321234567890" # Client secret value
+$certThumbprint = "123456789098765433221abc"    # Thumbrpint of authentication certificate
+$logFile = "C:\IT\Logs\mfaRemind_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 # Counters for summary
 $sentCount = 0
 $skippedCount = 0
 $failedCount = 0
 
-# Function to log messages with timestamps
+# Function to log messages in CMTrace format
 function Write-Log {
-    param([string]$Message)
-    $time = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $entry = "$time - $Message"
-    Add-Content -Path $logFile -Value $entry
+    param(
+        [string]$Message,
+        [int]$Type=1 # 1=Info, 2=Warning, 3=Error
+    )
+    $time = (Get-Date -Format "HH:mm:ss.ffffff")
+    $date = (Get-Date -Format "MM-dd-yyyy")
+    $thread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    $logEntry = "<![LOG[$Message]LOG]!><time=""$time"" date=""$date"" component=""mfaRemind.ps1"" context="""" type=""$Type"" thread=""$thread"" file=""$logFile"">"
+    $entry = "$((Get-Date).ToString("yyyy-MM-dd HH:mm:ss")) - $Message"
+    Add-Content -Path $logFile -Value $logEntry
     Write-Output $entry
 }
 
 # ===========================
 # Authentication
 # ===========================
-# Convert client secret to a secure string
+# Get certificate object
+$cert = Get-ChildItem Cert:\LocalMachine\My\$certThumbprint
+    
 #$pass = ConvertTo-SecureString -String $clientSecretValue -AsPlainText -Force
 
 # Build credential object (App ID + secret)
 #$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $applicationId, $pass
 
-# Build certificate object
-$cert = Get-ChildItem Cert:\LocalMachine\My\$certThumbprint
-
 # Connect to Microsoft Graph with app-only authentication
 try {
     #Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $cred -NoWelcome
     Connect-MgGraph -TenantId $tenantId -ClientId $applicationId -Certificate $cert -NoWelcome
-    Write-Log "Connected to Microsoft Graph successfully."
+    Write-Log -Message "Connected to Microsoft Graph successfully." -Type 1
 }
 catch {
-    Write-Log "ERROR: Failed to connect to Microsoft Graph. $_"
+    Write-Log -Message "ERROR: Failed to connect to Microsoft Graph. $_" -Type 3
     exit 1
 }
 
 # ===========================
 # Email Setup
 # ===========================
-$sender = "helpdesk@ocpmgmt.com"   # From address
+$sender = "sender@example.com"   # From address
 $subject = "Action Required: Please Enable MFA for Microsoft 365"
 
 # Attachment: MFA setup guide
@@ -80,9 +86,18 @@ $attachmentContent = [Convert]::ToBase64String([IO.File]::ReadAllBytes($filePath
 # User Loop
 # ===========================
 # Get users who have SSPR enabled but are NOT MFA capable
-Get-MgReportAuthenticationMethodUserRegistrationDetail | Where-Object {
-    $_.IsSsprEnabled -and -not $_.IsMfaCapable
-} | ForEach-Object {
+try{
+    $users = Get-MgReportAuthenticationMethodUserRegistrationDetail -All | Where-Object {
+        $_.IsSsprEnabled -and -not $_.IsMfaCapable
+    }   
+    Write-Log -Message "Retrieved $($users.Count) users eligible for MFA reminder processing." -Type 1
+}
+catch{
+    Write-Log -Message "Failed to retrive user list from Graph. $_" -Type 3
+    exit 1
+}
+
+$users | ForEach-Object{
     $user = $($_.userPrincipalName).ToString().Trim()
 
     # Skip users who are members of "M365 MFA NoWarn" group
@@ -95,7 +110,7 @@ Get-MgReportAuthenticationMethodUserRegistrationDetail | Where-Object {
         }
     }
     catch {
-        Write-Log "WARNING: Could not check NoWarn group membership for $user. $_"
+        Write-Log -Message "WARNING: Could not check NoWarn group membership for $user. $_" -Type 2
         $isNoWarn = $true # default to skipping if check fails
     }
 
@@ -146,16 +161,16 @@ Thank you for helping us keep our systems secure.<br>
         # Attempt to send the email
         try {
             Send-MgUserMail -UserId $sender -BodyParameter $emailParams
-            Write-Log "SUCCESS: MFA reminder sent to $recipient"
+            Write-Log -Message "SUCCESS: MFA reminder sent to $recipient" -Type 1
             $sentCount++
         }
         catch {
-            Write-Log "ERROR: Failed to send MFA reminder to $recipient. $_"
+            Write-Log -Message "ERROR: Failed to send MFA reminder to $recipient. $_" -Type 2
             $failedCount++
         }
     }
     else {
-        Write-Log "SKIPPED: $user is in M365 MFA NoWarn group or check failed."
+        Write-Log -Message "SKIPPED: $user is in M365 MFA NoWarn group or check failed." -Type 1
         $skippedCount++
     }
 }
@@ -163,5 +178,6 @@ Thank you for helping us keep our systems secure.<br>
 # ===========================
 # Summary
 # ===========================
-Write-Log "Script completed."
-Write-Log "Summary: Sent = $sentCount | Skipped = $skippedCount | Failed = $failedCount"
+Write-Log -Message "Script completed." -Type 1
+Write-Log -Message "Summary: Sent = $sentCount | Skipped = $skippedCount | Failed = $failedCount" -Type 1
+Disconnect-MgGraph | Out-Null
