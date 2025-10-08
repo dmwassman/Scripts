@@ -89,7 +89,7 @@ $attachmentContent = [Convert]::ToBase64String([IO.File]::ReadAllBytes($filePath
 try{
     $users = Get-MgReportAuthenticationMethodUserRegistrationDetail -All | Where-Object {
         $_.IsSsprEnabled -and -not $_.IsMfaCapable
-    }   
+    }  | Sort-Object -Property userPrincipalName 
     Write-Log -Message "Retrieved $($users.Count) users eligible for MFA reminder processing." -Type 1
 }
 catch{
